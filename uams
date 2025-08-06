@@ -1,0 +1,242 @@
+library(dplyr)
+library(tidyverse)
+library(pacman)
+library(randomForest)
+library(caret)
+library(pROC)
+library(Rtsne)
+library(ggplot2)
+library(vegan)
+
+#Clear Packages
+pacman::p_unload(pacman::p_loaded(), character.only = TRUE)
+
+pacman::p_load(knitr, ggplot2, gplots, ggtree, tibble, tidytree, dplyr, tidyr, readr, harrietr, pheatmap, viridis, RColorBrewer, factoextra, FactoMineR, tidyselect, M3C, vegan, ggpubr, caret )
+pacman::p_load(ggrepel)
+
+#Heatmap saving function
+save_pheatmap_png <- function(x, filename, width=10, height=10, res = 300) {
+  png(filename, width = width, height = height, res = res, units = "in")
+  grid::grid.newpage()
+  grid::grid.draw(x$gtable)
+  dev.off()
+}
+# Drop rows and coluns containing all zero
+drop.zero <- function(df){
+  target_data <- colnames(df[which(sapply(df, is.numeric))])
+  zero_row <- which(rowSums(df[, target_data]) == 0)
+  print(paste(length(zero_row), "row(s) with all zeros"))
+  zero_col <- which(colSums(df[, target_data]) == 0)
+  print(paste(length(zero_col), "col(s) with all zeros"))
+  if (length(zero_row) !=0){
+    rm_row <- (-zero_row)
+  } else {
+    rm_row <- c(1:nrow(df))
+  }
+  if (length(zero_col) !=0){
+    keep_col <- colnames(df[, !(colnames(df) %in% names(zero_col))])
+  } else {
+    keep_col <- c(1:ncol(df))
+  }
+  df2 <- df[rm_row, keep_col]
+  return(df2)
+}
+# Function to create a prevalence table
+prev.table <- function(ps_group)
+{
+  ## Calculate relative abundance
+  ps_set_rab <- transform_sample_counts(
+    ps_group,
+    function(x) {round((x / sum(x)), 6)}
+  )
+  ## counts to relative abundance
+  ps_set_mean_rab <- apply(X = otu_table(ps_set_rab),
+                           MARGIN = ifelse(taxa_are_rows(ps_set_rab), yes = 1, no = 2),
+                           FUN = function(x) {mean(x)}
+  )
+  ## Calculate prevalence
+  prev <- apply(X = otu_table(ps_group),
+                MARGIN = ifelse(taxa_are_rows(ps_group), yes = 1, no = 2),
+                FUN = function(x){sum(x > 0)}
+  )
+  ## Add taxonomy and total read counts to this data.frame
+  prevdf1 <- data.frame("otu_id" = names(prev),
+                        "Prevalence" = prev,
+                        "FracSample_percent" = round(
+                          (prev / nsamples(ps_group)) * 100, 2
+                        ),
+                        #"TotalAbundance" = taxa_sums(ps),
+                        "MeanRelAb_percent" = ps_set_mean_rab * 100
+  )
+  prevdf2 <- merge(prevdf1, otu2sp, by = "otu_id", all.x = TRUE)
+  prev_df <- prevdf2[order(prevdf2$Prevalence, decreasing = TRUE), ]
+  return(prev_df)
+}
+#Load the main files you will need.
+all_samples_table <- read_csv("/Users/michiko/Desktop/Drexel/Alzheimer/aug2/post_final_results_uams.csv")
+info<-read_csv("/Users/michiko/Desktop/Drexel/Alzheimer/aug2/alz-16S_sample_metadata.csv")
+otu_count_table <- all_samples_table %>%
+  select(-domain:-num_of_otus_with_same_sp) %>%
+  pivot_longer(cols = -OTU_ID, names_to = "sample_ID", values_to = "count")  %>%
+  inner_join(select(info, sample_ID)) %>%
+  group_by(OTU_ID) %>%
+  mutate(total = sum(count)) %>% 
+  ungroup() %>%
+  filter(total > 0) %>% #get rid of OTU no longer present
+  pivot_wider(id_cols = OTU_ID, names_from = sample_ID, values_from = count)
+write_tsv(otu_count_table, "rlane_otu_counts.tsv")
+
+
+control_samps <- info %>%
+  filter(type == "NA")
+#Create a taxonomic info table
+otu_tax_info <- all_samples_table %>%
+  select(OTU_ID, domain:num_of_otus_with_same_sp)
+write_tsv(otu_tax_info, "rlane_otu_tax.tsv")
+
+
+max_ctrl_counts <- all_samples_table %>%  
+  select(-domain:-num_of_otus_with_same_sp, species) %>% 
+  pivot_longer(cols = c(-species, -OTU_ID), names_to = "sample_ID", values_to = "counts") %>%  
+  inner_join(info) %>% 
+  filter(diagnosis == "NA" & type == "NA") %>% 
+  group_by(OTU_ID) %>%
+  summarize(max_ctrl = max(counts)) %>% 
+  ungroup() %>%
+  filter(max_ctrl > 0) %>%
+  inner_join(select(otu_tax_info, OTU_ID, species))
+
+filt_otu_5pct <- otu_count_table %>% 
+  pivot_longer(cols = -OTU_ID, names_to = "sample_ID", values_to = "counts") %>%
+  full_join(select(max_ctrl_counts, OTU_ID, max_ctrl)) %>% #join with max control otu counts
+  replace_na(list(max_ctrl=0)) %>% #missing max control otu counts should just be zero
+  mutate(count_no_ctrl = if_else((counts - max_ctrl)<0,true=0,false=counts-max_ctrl)) %>% #modify sample counts by subtracting off max control otu counts - if that would be a negative value, it's just zero 
+  filter(!sample_ID %in% control_samps$sample_ID) %>% 
+  group_by(sample_ID) %>%
+  mutate(samp_num_reads = sum(count_no_ctrl)) %>% 
+  filter(samp_num_reads > 100) %>% 
+  mutate(percent_otu = count_no_ctrl/samp_num_reads) %>% 
+  ungroup() %>%
+  group_by(OTU_ID) %>%
+  mutate(percent_max = max(percent_otu)) %>% 
+  ungroup() %>%
+  filter(percent_max > .05) %>% #setting this to 5% for heatmap, but probably want 1% for diversity metrics
+  pivot_wider(id_cols = OTU_ID, names_from = sample_ID, values_from = percent_otu) %>%
+  as.data.frame()
+#error
+filt_species <- filt_otu_5pct %>%
+  inner_join(select(otu_tax_info, OTU_ID, species)) %>%
+  select(species)
+row.names(filt_otu_5pct) <- paste( filt_otu_5pct$OTU_ID, filt_species$species, sep = "_")
+
+#add a pseudocount
+filt_otu_5pct[filt_otu_5pct==0] <- .000000001
+
+#Convert into a matrix for pheatmap  to work and get rid of OTU_ID
+otu_matrix <- as.matrix(filt_otu_5pct[,-1])
+
+#Transform into log scale so that you can work with your matrix
+otu_matrix_log <- log10(otu_matrix)
+
+otu_mat_log <- t(otu_matrix_log)
+alz_PCA <- PCA(otu_mat_log)
+alz_pca_df <- as.data.frame(alz_PCA$ind$coord[,1:2]) %>%
+  rownames_to_column(var = "rName") %>%
+  inner_join(info, by = c("rName" = "sample_ID"))
+
+# Example: assuming your data frame is called df and sample names are column names
+samples_to_remove <- grep("^(dc_|wa_|nk_)", colnames(df), value = TRUE)
+
+
+#transpose matrix for PCA on location with diagnosis
+samples_to_remove <- c("negative_pcr","negative_pcr1")
+### Label the axes
+axis.x.label <- paste("PC1: ", round(alz_PCA$eig[1,2], 2), "%")
+axis.y.label <- paste("PC2: ", round(alz_PCA$eig[2,2], 2), "%")
+
+
+alz_pca_df_filtered <- alz_pca_df %>%
+  filter(!rName %in% samples_to_remove)
+
+alz_pca_df_filtered <- alz_pca_df_filtered %>%
+  filter(!is.na(location) & location != "Blindstudy")
+
+#Removing Washington samples
+alz_pca_df_filtered <- alz_pca_df_filtered %>%
+  filter(!grepl("^wa_", rName))  # or sample_name column
+
+
+#Chatgpt troubleshoot
+ggplot(alz_pca_df_filtered, aes(x = Dim.1, y = Dim.2, color = location, shape = diagnosis)) +
+  geom_point(size = 2.5) +
+  geom_text_repel(aes(label = rName), size = 3.5, max.overlaps = Inf) +
+  labs(color = "location", shape = "diagnosis") +
+  scale_color_manual(labels = c("F", "T", "EC"), 
+                     breaks = c("F", "T", "EC"), 
+                     values = c("pink", "purple", "lightgreen")) +
+  scale_shape_manual(labels = c("AD", "AMC"), 
+                     breaks = c("AD", "AMC"), 
+                     values = c(16, 17)) +
+  xlab(axis.x.label) +
+  ylab(axis.y.label) +
+  theme_bw() +
+  theme(text = element_text(size = 12),
+        axis.title = element_text(size = 12),
+        axis.text = element_text(size = 12))
+geom_text_repel(aes(label = rName), 
+                size = 2.5, 
+                max.overlaps = Inf, 
+                box.padding = 0.6, 
+                point.padding = 0,
+                force = 1, 
+                force_pull = 3)
+
+ggsave('pca_uams_sample_072525_LOCATION with LABELS.png', width = 35, height = 8)
+
+mds <- metaMDS(t(otu_matrix_log), distance = "euclid")
+#ploting the distribution
+stressplot(mds)
+NMDS.scree <- function(x) { #where x is the name of the data frame variable
+  plot(rep(1, 10), replicate(10, metaMDS(x, autotransform = F, k = 1)$stress), xlim = c(1, 10),ylim = c(0, 0.30), xlab = "# of Dimensions", ylab = "Stress", main = "NMDS stress plot")
+  for (i in 1:10) {
+    points(rep(i + 1,10),replicate(10, metaMDS(x, autotransform = F, k = i + 1)$stress))
+  }
+}
+# Use the function that we just defined to choose the optimal nr of dimensions
+NMDS.scree(dist(t(otu_matrix_log)))
+#Convert to table for ggploting
+mds_df <- as.data.frame(mds$points) %>%
+  rownames_to_column(var='sample_ID') %>%
+  inner_join(info)
+
+mds_df <- as.data.frame(mds$points) %>%
+  rownames_to_column(var='sample_ID') %>%
+  inner_join(info)
+mds_df_filtered <- mds_df %>%
+  filter(!sample_ID %in% samples_to_remove)
+
+
+#Troubleshoot
+# Remove NA and Wisconsin samples
+mds_df_filtered <- mds_df_filtered %>%
+  filter(!is.na(core_edge)) %>%
+  filter(!grepl("^wi_", sample_ID))  # Or use appropriate column if available
+
+# Plot
+ggplot(mds_df_filtered, aes(x = MDS1, y = MDS2, color = location, shape = diagnosis)) + 
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = sample_ID), size = 3, max.overlaps = Inf) +
+  labs(color = "location", shape = "Diagnosis") +
+  scale_color_manual(
+    labels = c("F","T","EC"),
+    breaks = c("F","T","EC"),
+    values = c("pink","purple","darkgreen")
+  ) +
+  scale_shape_manual(
+    labels = c("AD", "AMC"),
+    breaks = c("AD", "AMC"),
+    values = c(16, 17)
+  ) +
+  theme_bw()
+
+ggsave("nmMDS_uams_080325_samples_with_labels.png", width = 6, height = 6, units = "in")
